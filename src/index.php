@@ -8,7 +8,31 @@ if (!file_exists($json_file)) file_put_contents($json_file, json_encode([]));
 $initial_data_raw = file_get_contents($json_file);
 $transactions_array = json_decode($initial_data_raw, true) ?: [];
 
-// Liste des catégories
+// Catégories (pour CSVParserService + select UI)
+$categories_map = [
+    'REVENUE' => [
+        'Dienstleistungen' => ['AUSZAHLUNG', 'UEBERWEISUNG', 'TRANSFER', 'ZAHLUNG', 'ENTGELT', 'HONORAR'],
+        'Versand/Provision' => ['PAYPAL', 'STRIPE', 'AMAZON', 'EBAY'],
+    ],
+    'EXPENSES' => [
+        'Bezogene Fremdleistungen' => ['FREELANCER', 'SUBUNTERNEHMER', 'AGENTUR', 'DESIGNER'],
+        'Telekommunikation' => ['VODAFONE', 'TELEKOM', 'O2', 'TELEFONICA', 'INTERNET'],
+        'Reisekosten' => ['LUFTHANSA', 'RYANAIR', 'BOOKING', 'HOTEL', 'BAHNTICKET', 'BAHN'],
+        'Fortbildungskosten' => ['UDEMY', 'COURSERA', 'SKILLSHARE', 'SEMINAIRE', 'TRAINING', 'WORKSHOP'],
+        'Steuerberatung' => ['STEUERBERATER', 'BUCHHAELTER', 'STEUERKANZLEI', 'TAX'],
+        'Laufende EDV-Kosten' => ['ADOBE', 'MICROSOFT', 'APPLE', 'GOOGLE', 'AWS', 'CLOUD', 'GITHUB', 'FIGMA', 'SLACK', 'HOSTING'],
+        'Arbeitsmittel' => ['EDEKA', 'REWE', 'ALDI', 'LIDL', 'MODULOR', 'STAPLES', 'OFFICE'],
+        'Werbekosten' => ['GOOGLE ADS', 'FACEBOOK', 'INSTAGRAM', 'LINKEDIN', 'WERBUNG', 'DRUCKEREI'],
+        'Bewirtungsaufwendungen' => ['RESTAURANT', 'CAFE', 'BAR', 'PIZZA', 'SUMUP', 'BURGER'],
+        'Treibstoff' => ['SHELL', 'ARAL', 'BP', 'ESSO', 'TOTAL', 'TANKSTELLE', 'DIESEL'],
+        'Versicherungen' => ['VERSICHERUNG', 'INSURANCE', 'AXA', 'ALLIANZ', 'DEBEKA', 'BARMER'],
+        'Bankgebühren' => ['BANKGEBUEHR', 'KONTOGEBUEHR', 'ZINSEN', 'PROVISIONEN', 'DKB'],
+        'Steuern' => ['FINANZAMT', 'STEUER', 'GEWERBESTEUER'],
+        'Privat' => ['PRIVAT', 'PERSONAL', 'PERSÖNLICH'],
+        'Sonstiges' => ['SONSTIGES', 'DIVERSES'],
+    ]
+];
+
 $categories_list = ["Privat", "Dienstleistungen", "Telekommunikation", "Reisekosten", "Werbekosten", "Büromaterial", "Hardware", "Software/SaaS", "Versicherungen", "Miete/Pacht", "Bankgebühren", "Sonstiges"];
 foreach ($transactions_array as $tx) {
     if (!empty($tx['category']) && !in_array($tx['category'], $categories_list)) {
@@ -17,8 +41,20 @@ foreach ($transactions_array as $tx) {
 }
 sort($categories_list);
 
+// Helper pour get_next_id utilisé par CSVParserService
+function get_next_id(): int {
+    global $transactions_array;
+    $max = 0;
+    foreach ($transactions_array as $tx) {
+        $max = max($max, intval($tx['numeric_id'] ?? 0));
+    }
+    return $max + 1;
+}
+
 // API LOGIQUE
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+
+    // Upload PJ (pièce jointe)
     if (isset($_FILES['file'])) {
         $tx_id = $_POST['tx_id'];
         $ext = pathinfo($_FILES['file']['name'], PATHINFO_EXTENSION);
@@ -28,7 +64,51 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
         exit;
     }
-    file_put_contents($json_file, file_get_contents('php://input'));
+
+    // Import CSV
+    if (isset($_FILES['csv'])) {
+        require_once __DIR__ . '/CSVParserService.php';
+        $content = file_get_contents($_FILES['csv']['tmp_name']);
+
+        // Détection encoding
+        $enc = mb_detect_encoding($content, 'UTF-8,ISO-8859-1,Windows-1252', true);
+        if ($enc && $enc !== 'UTF-8') {
+            $content = mb_convert_encoding($content, 'UTF-8', $enc);
+        }
+
+        $parser = new CSVParserService($categories_map);
+        $new_transactions = $parser->parse($content);
+
+        if (empty($new_transactions)) {
+            echo json_encode(['success' => false, 'error' => 'Format non reconnu ou fichier vide (EXTF, Datev, DKB supportés)']);
+            exit;
+        }
+
+        // Charger données existantes et dédupliquer par hash id
+        $existing = json_decode(file_get_contents($json_file), true) ?: [];
+        $existing_hashes = array_column($existing, 'id');
+
+        $added = 0;
+        foreach ($new_transactions as $tx) {
+            if (!in_array($tx['id'], $existing_hashes)) {
+                // Adapter le format pour la v19 (mwst au lieu de tva)
+                $tx['mwst'] = $tx['tva'] ?? 19;
+                $tx['isPrivate'] = ($tx['category'] === 'Privat');
+                $existing[] = $tx;
+                $added++;
+            }
+        }
+
+        file_put_contents($json_file, json_encode($existing));
+        echo json_encode(['success' => true, 'added' => $added, 'total' => count($existing), 'skipped' => count($new_transactions) - $added]);
+        exit;
+    }
+
+    // Sauvegarde JSON standard
+    $body = file_get_contents('php://input');
+    if ($body && json_decode($body) !== null) {
+        file_put_contents($json_file, $body);
+    }
     exit;
 }
 ?>
@@ -73,6 +153,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             <div class="flex gap-4 items-center flex-wrap">
                 <button onclick="openModal()" class="bg-[#00c47f] text-white px-5 py-2 rounded-lg font-bold flex items-center gap-2 hover:opacity-90">
                     <span>+</span> Ajouter
+                </button>
+                <button onclick="openImportModal()" class="bg-gray-800 text-white px-5 py-2 rounded-lg font-bold flex items-center gap-2 hover:opacity-90">
+                    ⬆ Import CSV
                 </button>
                 <label class="flex items-center gap-2 text-xs font-bold cursor-pointer bg-gray-50 px-3 py-2 rounded border border-gray-200">
                     <input type="checkbox" id="hidePrivateToggle" onchange="render()" class="w-4 h-4 accent-[#00c47f]"> Masquer privé
@@ -130,6 +213,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     </div>
 
     <input type="file" id="globalFilePicker" class="hidden" onchange="uploadFile(this.files[0])">
+
+    <!-- MODAL IMPORT CSV -->
+    <div id="importModal" class="modal">
+        <div class="modal-content" style="max-width:520px;">
+            <h2 class="text-xl font-black mb-1 border-b pb-2">⬆ Import CSV bancaire</h2>
+            <p class="text-xs text-gray-400 mb-4">Formats supportés : DATEV EXTF · DATEV · DKB<br>Les doublons sont automatiquement ignorés (déduplication par hash).</p>
+
+            <div id="importDropZone"
+                 class="border-2 border-dashed border-gray-300 rounded-xl p-10 text-center cursor-pointer transition-all hover:border-[#00c47f] hover:bg-green-50"
+                 onclick="document.getElementById('csvFilePicker').click()"
+                 ondragover="event.preventDefault(); this.classList.add('border-[#00c47f]','bg-green-50');"
+                 ondragleave="this.classList.remove('border-[#00c47f]','bg-green-50');"
+                 ondrop="event.preventDefault(); this.classList.remove('border-[#00c47f]','bg-green-50'); handleCSVDrop(event.dataTransfer.files[0]);">
+                <p class="text-3xl mb-2">📂</p>
+                <p class="font-bold text-gray-600">Glisser le fichier CSV ici</p>
+                <p class="text-xs text-gray-400 mt-1">ou cliquer pour choisir</p>
+                <input type="file" id="csvFilePicker" accept=".csv" class="hidden" onchange="handleCSVInput(this.files[0])">
+            </div>
+
+            <div id="importStatus" class="hidden mt-4 p-3 rounded-lg text-sm font-bold"></div>
+
+            <div class="flex gap-3 mt-5">
+                <button type="button" onclick="closeImportModal()" class="flex-1 border py-2 rounded-lg font-bold text-gray-400">Fermer</button>
+            </div>
+        </div>
+    </div>
 
 <script>
     let transactions = <?php echo $initial_data_raw ?: '[]'; ?>;
@@ -356,6 +465,50 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         await fetch('index.php', { method: 'POST', body: JSON.stringify(transactions) });
         btn.innerText = "SAUVEGARDÉ ✅"; setTimeout(() => btn.innerText = "Enregistrer", 2000);
     }
+    // ===== IMPORT CSV =====
+    function openImportModal() {
+        document.getElementById('importStatus').classList.add('hidden');
+        document.getElementById('importModal').style.display = 'flex';
+    }
+    function closeImportModal() {
+        document.getElementById('importModal').style.display = 'none';
+        document.getElementById('csvFilePicker').value = '';
+    }
+    function handleCSVDrop(file) { if (file) importCSV(file); }
+    function handleCSVInput(file) { if (file) importCSV(file); }
+
+    function importCSV(file) {
+        const status = document.getElementById('importStatus');
+        status.className = 'mt-4 p-3 rounded-lg text-sm font-bold bg-gray-100 text-gray-600';
+        status.classList.remove('hidden');
+        status.innerText = '⏳ Import en cours…';
+
+        const form = new FormData();
+        form.append('csv', file);
+
+        fetch('index.php', { method: 'POST', body: form })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    status.className = 'mt-4 p-3 rounded-lg text-sm font-bold bg-green-100 text-green-800';
+                    status.innerText = `✅ ${data.added} transaction(s) importée(s)${data.skipped > 0 ? ' · ' + data.skipped + ' doublon(s) ignoré(s)' : ''} · Total: ${data.total}`;
+                    // Recharger les données sans reloader la page
+                    fetch('index.php').then(r => r.text()).then(() => {
+                        fetch('index.php', { headers: {'Accept':'application/json'} });
+                    });
+                    // Simple reload après 2s pour afficher les nouvelles transactions
+                    setTimeout(() => { closeImportModal(); location.reload(); }, 2200);
+                } else {
+                    status.className = 'mt-4 p-3 rounded-lg text-sm font-bold bg-red-100 text-red-800';
+                    status.innerText = '❌ ' + (data.error || 'Erreur inconnue');
+                }
+            })
+            .catch(e => {
+                status.className = 'mt-4 p-3 rounded-lg text-sm font-bold bg-red-100 text-red-800';
+                status.innerText = '❌ Erreur réseau : ' + e;
+            });
+    }
+
     render();
 </script>
 </body>
