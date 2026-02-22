@@ -8,7 +8,7 @@
  * - Recherche et tris avancés
  */
 
-define('PASSWORD', 'accounting123');
+define('PASSWORD', 'bonjour');
 define('JSON_FILE', __DIR__ . '/data.json');
 define('UPLOADS_DIR', __DIR__ . '/uploads');
 define('SESSION_NAME', 'accounting_auth');
