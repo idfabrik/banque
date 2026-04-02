@@ -38,6 +38,14 @@ class CSVParserService {
         $lines = explode("\n", trim($content));
         $format = $this->detectFormat($lines);
         
+        $bank_label = match($format) {
+            'datev_extf' => 'DATEV',
+            'datev' => 'DATEV',
+            'dkb' => 'DKB',
+            'ing' => 'ING',
+            default => ''
+        };
+
         $transactions = match($format) {
             'datev_extf' => $this->parseDatevExtf($lines),
             'datev' => $this->parseDatev($lines),
@@ -45,21 +53,29 @@ class CSVParserService {
             'ing' => $this->parseIng($lines),
             default => []
         };
-        
+
+        // Injecter la banque source dans les notes
+        if ($bank_label) {
+            foreach ($transactions as &$tx) {
+                $tx['notes'] = $bank_label;
+            }
+            unset($tx);
+        }
+
         error_log("CSVParser: Détecté " . count($transactions) . " transactions au format: $format");
-        
+
         return $transactions;
     }
     
     private function detectFormat(array $lines): string {
-        for ($i = 0; $i < min(10, count($lines)); $i++) {
+        for ($i = 0; $i < min(15, count($lines)); $i++) {
             if (strpos($lines[$i], 'EXTF') !== false) {
                 return 'datev_extf';
             } elseif (strpos($lines[$i], 'Datev') !== false && strpos($lines[$i], '284') !== false) {
                 return 'datev';
             } elseif (strpos($lines[$i], 'Buchungsdatum') !== false) {
                 return 'dkb';
-            } elseif (strpos($lines[$i], 'Buchung;Wertstellungsdatum') !== false) {
+            } elseif (strpos($lines[$i], 'Bank;ING') !== false || strpos($lines[$i], 'Buchung;Wertstellungsdatum') !== false) {
                 return 'ing';
             }
         }
@@ -213,21 +229,34 @@ class CSVParserService {
             $purpose     = trim($cols[5] ?? '', '" ');
             $direction   = trim($cols[6] ?? '', '" '); // "Eingang" = revenu entrant
 
-            // DKB met parfois "ISSUER" ou une valeur vide/technique en col[3]
-            // pour les paiements par carte ou Lastschrift.
-            // Priorité : col[3] si nom réel, sinon col[4], sinon extraire du purpose.
-            $dkb_placeholders = ['ISSUER', 'IBAN', 'BIC', 'SEPA', ''];
-            if (in_array(strtoupper($counterpart), $dkb_placeholders)) {
-                // Essayer col[4]
+            // DKB: col[3] = Zahlungspflichtige*r (payeur), col[4] = Zahlungsempfänger*in (destinataire)
+            // Pour Ausgang → le vrai bénéficiaire est col[4] (à qui on paie)
+            // Pour Eingang → le vrai bénéficiaire est col[3] (qui nous paie)
+            $dkb_placeholders = ['ISSUER', 'IBAN', 'BIC', 'SEPA', '', 'DKB AG'];
+
+            if ($direction === 'Ausgang') {
+                // Dépense : priorité col[4] (destinataire)
                 if (!empty($col4) && !in_array(strtoupper($col4), $dkb_placeholders)) {
                     $beneficiary = $col4;
+                } elseif (!empty($counterpart) && !in_array(strtoupper($counterpart), $dkb_placeholders)) {
+                    $beneficiary = $counterpart;
                 } else {
-                    // Extraire le premier segment lisible du purpose (avant le premier /)
+                    $parts = preg_split('/\s{2,}|\/|\|/', $purpose, 2);
+                    $beneficiary = !empty(trim($parts[0])) ? trim($parts[0]) : $purpose;
+                }
+            } elseif ($direction === 'Eingang') {
+                // Recette : priorité col[3] (payeur)
+                if (!empty($counterpart) && !in_array(strtoupper($counterpart), $dkb_placeholders)) {
+                    $beneficiary = $counterpart;
+                } elseif (!empty($col4) && !in_array(strtoupper($col4), $dkb_placeholders)) {
+                    $beneficiary = $col4;
+                } else {
                     $parts = preg_split('/\s{2,}|\/|\|/', $purpose, 2);
                     $beneficiary = !empty(trim($parts[0])) ? trim($parts[0]) : $purpose;
                 }
             } else {
-                $beneficiary = $counterpart;
+                // Fallback
+                $beneficiary = !empty($col4) ? $col4 : $counterpart;
             }
 
             $amount = trim($cols[8], '" ');
@@ -435,7 +464,13 @@ class CSVParserService {
     ): array {
         $type = ($montant > 0) ? 'Entrée' : 'Dépense';
         $amount = abs($montant);
-        
+        $category = $this->categorizeTransaction($beneficiary . ' ' . $purpose);
+
+        // Règles de catégorisation forcée → Privat
+        if ($this->isPrivateBeneficiary($beneficiary)) {
+            $category = 'Privat';
+        }
+
         return [
             'id' => '',
             'numeric_id' => $this->getNextNumericId(),
@@ -444,7 +479,7 @@ class CSVParserService {
             'beneficiary' => $beneficiary,
             'purpose' => $purpose,
             'amount' => $amount,
-            'category' => $this->categorizeTransaction($beneficiary . ' ' . $purpose),
+            'category' => $category,
             'tva' => ($type === 'Entrée') ? 0 : 19,
             'attachments' => $attachments,
             'notes' => '',
@@ -452,6 +487,38 @@ class CSVParserService {
         ];
     }
     
+    private function isPrivateBeneficiary(string $beneficiary): bool {
+        $privat_beneficiaries = [
+            'TAWAN ARUN',
+            'ARUN,TAWAN',
+            'ARUN, TAWAN',
+            'ARUN',
+            'ABSCHLUSS',
+            'ANAIS EDELY',
+            'MONOP\'',
+            'AUCHAN',
+            'BACKEREI ARMBRUSTER',
+            'BÄCKEREI ARMBRUSTER',
+            'EDEKA',
+            'REWE',
+            'LA MAISON',
+            'PENNY',
+            'BBSV BERLIN-BRANDENBURGER',
+            'WEG FORSTER 55',
+            'ALLIANZ VERSICHERUNGS-AKTIENGESELLSCHAFT',
+            'TINO KNOBEL IMMOBILIEN',
+            'BAUSPARKASSE SCHWABISCH HALL',
+            'SANTANDER CONSUMER BANK',
+        ];
+        $ben_upper = strtoupper(trim($beneficiary));
+        foreach ($privat_beneficiaries as $name) {
+            if ($ben_upper === $name || strpos($ben_upper, $name) !== false) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private function categorizeTransaction(string $text): string {
         $text = strtoupper($text);
         

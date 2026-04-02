@@ -24,6 +24,7 @@ $categories_map = [
         'Steuerberatung' => ['STEUERBERATER', 'BUCHHAELTER', 'STEUERKANZLEI', 'TAX'],
         'Laufende EDV-Kosten' => ['ADOBE', 'MICROSOFT', 'APPLE', 'GOOGLE', 'AWS', 'CLOUD', 'GITHUB', 'FIGMA', 'SLACK', 'HOSTING'],
         'Arbeitsmittel' => ['EDEKA', 'REWE', 'ALDI', 'LIDL', 'MODULOR', 'STAPLES', 'OFFICE'],
+        'Bürokosten' => ['POST', 'PORTO', 'DHL', 'HERMES', 'DPD', 'UPS', 'BRIEFMARKE', 'PIN.AG', 'PAPETERIE'],
         'Werbekosten' => ['GOOGLE ADS', 'FACEBOOK', 'INSTAGRAM', 'LINKEDIN', 'WERBUNG', 'DRUCKEREI'],
         'Bewirtungsaufwendungen' => ['RESTAURANT', 'CAFE', 'BAR', 'PIZZA', 'SUMUP', 'BURGER'],
         'Treibstoff' => ['SHELL', 'ARAL', 'BP', 'ESSO', 'TOTAL', 'TANKSTELLE', 'DIESEL'],
@@ -45,6 +46,7 @@ $categories_list = [
     'Telekommunikation',
     'Reisekosten',
     'Werbekosten',
+    'Bürokosten',
     'Büromaterial',
     'Hardware',
     'Software/SaaS',
@@ -132,13 +134,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $stamp = date('Y-m-d_H-i-s');
         copy($json_file, $backups_dir . "/data_{$stamp}_before_dedup.json");
 
-        // Regrouper par empreinte (date + montant + bénéficiaire normalisé)
-        // Pour chaque groupe, on compare les purpose pour distinguer les vrais doublons
-        // des achats légitimement identiques (ex: 2x Steinecke le même jour)
+        // Regrouper par empreinte (date + montant + purpose normalisé)
+        // Le purpose est stable entre versions du parser, contrairement au bénéficiaire
         $groups = [];
         foreach ($existing as $idx => $tx) {
-            $ben_norm = strtoupper(preg_replace('/[^A-Z0-9]/i', '', $tx['beneficiary'] ?? ''));
-            $key = $tx['date'] . '|' . round(floatval($tx['amount']), 2) . '|' . $ben_norm;
+            $purp_norm = strtoupper(preg_replace('/[^A-Z0-9]/i', '', $tx['purpose'] ?? ''));
+            $key = $tx['date'] . '|' . round(floatval($tx['amount']), 2) . '|' . $purp_norm;
             $groups[$key][] = $idx;
         }
 
@@ -149,39 +150,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         foreach ($groups as $key => $indices) {
             if (count($indices) <= 1) continue; // pas de doublon
 
-            // Sous-grouper par purpose normalisé pour ne pas fusionner des transactions distinctes
-            $by_purpose = [];
+            // Vrais doublons : même date+montant+purpose → garder le meilleur
+            $best_idx = $indices[0];
+            $best_score = 0;
             foreach ($indices as $idx) {
-                $purpose_norm = strtoupper(preg_replace('/[^A-Z0-9]/i', '', $existing[$idx]['purpose'] ?? ''));
-                // Si purpose vide → clé spéciale pour les regrouper ensemble
-                $pkey = $purpose_norm ?: '__EMPTY__';
-                $by_purpose[$pkey][] = $idx;
-            }
-
-            foreach ($by_purpose as $pkey => $sub_indices) {
-                if (count($sub_indices) <= 1) continue;
-
-                // Vrais doublons : même date+montant+bénéficiaire+purpose → garder le meilleur
-                $best_idx = $sub_indices[0];
-                $best_score = 0;
-                foreach ($sub_indices as $idx) {
-                    $tx = $existing[$idx];
-                    $score = (count($tx['attachments'] ?? []) * 10)
-                        + (strlen($tx['notes'] ?? '') > 0 ? 5 : 0)
-                        + (strlen($tx['category'] ?? '') > 0 ? 2 : 0)
-                        + (strlen($tx['purpose'] ?? '') > 0 ? 1 : 0);
-                    if ($score > $best_score) {
-                        $best_score = $score;
-                        $best_idx = $idx;
-                    }
+                $tx = $existing[$idx];
+                $score = (count($tx['attachments'] ?? []) * 10)
+                    + (strlen($tx['notes'] ?? '') > 0 ? 5 : 0)
+                    + (strlen($tx['category'] ?? '') > 0 ? 2 : 0)
+                    + (strlen($tx['beneficiary'] ?? '') * 0.1); // préférer le bénéficiaire le plus complet
+                if ($score > $best_score) {
+                    $best_score = $score;
+                    $best_idx = $idx;
                 }
-                // Marquer les autres comme doublons
-                foreach ($sub_indices as $idx) {
-                    if ($idx !== $best_idx) {
-                        $dominated[$idx] = true;
-                        $tx = $existing[$idx];
-                        $removed[] = ['id' => $tx['numeric_id'] ?? '', 'date' => $tx['date'], 'beneficiary' => $tx['beneficiary'], 'amount' => $tx['amount']];
-                    }
+            }
+            // Marquer les autres comme doublons
+            foreach ($indices as $idx) {
+                if ($idx !== $best_idx) {
+                    $dominated[$idx] = true;
+                    $tx = $existing[$idx];
+                    $removed[] = ['id' => $tx['numeric_id'] ?? '', 'date' => $tx['date'], 'beneficiary' => $tx['beneficiary'], 'amount' => $tx['amount']];
                 }
             }
         }
@@ -235,19 +223,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // Charger données existantes
         $existing = json_decode(file_get_contents($json_file), true) ?: [];
 
-        // Index de déduplication
+        // Index de déduplication (stocke l'index dans $existing pour pouvoir mettre à jour)
         // 1. Hash exact (SHA-256 sur date+montant+bénéficiaire+objet+type)
-        $existing_hashes = array_fill_keys(array_column($existing, 'id'), true);
+        $existing_hashes = [];
+        foreach ($existing as $idx => $tx) {
+            $existing_hashes[$tx['id']] = $idx;
+        }
 
-        // 2. Empreinte semi-stricte (date + montant + bénéficiaire + purpose normalisés) → BLOQUE l'import
-        //    Protège contre les réimports cross-banque ou après changement de parser
-        //    Inclut le purpose pour ne pas bloquer 2 achats identiques le même jour (purpose différent)
+        // 2. Empreinte semi-stricte (date + montant + purpose normalisé)
+        //    Sans le bénéficiaire → résiste aux changements de logique d'extraction
+        //    Le purpose distingue les achats distincts (ex: 2x Steinecke = 2 numéros VISA différents)
         $strict_fingerprints = [];
-        foreach ($existing as $tx) {
-            $ben_norm = strtoupper(preg_replace('/[^A-Z0-9]/i', '', $tx['beneficiary'] ?? ''));
+        foreach ($existing as $idx => $tx) {
             $purp_norm = strtoupper(preg_replace('/[^A-Z0-9]/i', '', $tx['purpose'] ?? ''));
-            $key = $tx['date'] . '|' . round(floatval($tx['amount']), 2) . '|' . $ben_norm . '|' . $purp_norm;
-            $strict_fingerprints[$key] = true;
+            $key = $tx['date'] . '|' . round(floatval($tx['amount']), 2) . '|' . $purp_norm;
+            $strict_fingerprints[$key] = $idx;
         }
 
         // 3. Empreinte souple (date + montant arrondi) → importer mais signaler en jaune
@@ -259,24 +249,58 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
         $added      = 0;
         $skipped    = 0;
+        $updated    = 0;
         $soft_dupes = 0;
         $soft_dupe_list = [];
+
+        // Met à jour une transaction existante avec les infos du réimport,
+        // sans écraser les infos personnalisées (catégorie, PJ, notes custom)
+        $updateExisting = function(int $idx, array $new_tx) use (&$existing, &$updated) {
+            $old = &$existing[$idx];
+            $changed = false;
+
+            // Ajouter la banque source dans les notes si pas déjà présente
+            $new_notes = trim($new_tx['notes'] ?? '');
+            $old_notes = trim($old['notes'] ?? '');
+            if ($new_notes && strpos($old_notes, $new_notes) === false) {
+                $old['notes'] = $old_notes ? $old_notes . ' | ' . $new_notes : $new_notes;
+                $changed = true;
+            }
+
+            // Mettre à jour le bénéficiaire si le nouveau est plus complet
+            $old_ben = trim($old['beneficiary'] ?? '');
+            $new_ben = trim($new_tx['beneficiary'] ?? '');
+            if (!empty($new_ben) && strlen($new_ben) > strlen($old_ben)) {
+                $old['beneficiary'] = $new_ben;
+                $changed = true;
+            }
+
+            // Mettre à jour la catégorie si le réimport force "Privat" et que l'existante ne l'est pas encore
+            if (($new_tx['category'] ?? '') === 'Privat' && ($old['category'] ?? '') !== 'Privat') {
+                $old['category'] = 'Privat';
+                $old['isPrivate'] = true;
+                $changed = true;
+            }
+
+            if ($changed) $updated++;
+        };
 
         foreach ($new_transactions as $tx) {
             $tx['mwst']      = $tx['tva'] ?? 19;
             $tx['isPrivate'] = ($tx['category'] === 'Privat');
 
-            // Doublon exact (hash) → ignorer
+            // Doublon exact (hash) → mettre à jour notes, pas d'ajout
             if (isset($existing_hashes[$tx['id']])) {
+                $updateExisting($existing_hashes[$tx['id']], $tx);
                 $skipped++;
                 continue;
             }
 
-            // Doublon semi-strict (date + montant + bénéficiaire + purpose) → ignorer
-            $ben_norm = strtoupper(preg_replace('/[^A-Z0-9]/i', '', $tx['beneficiary'] ?? ''));
+            // Doublon semi-strict (date + montant + purpose) → mettre à jour, pas d'ajout
             $purp_norm = strtoupper(preg_replace('/[^A-Z0-9]/i', '', $tx['purpose'] ?? ''));
-            $strict_key = $tx['date'] . '|' . round(floatval($tx['amount']), 2) . '|' . $ben_norm . '|' . $purp_norm;
+            $strict_key = $tx['date'] . '|' . round(floatval($tx['amount']), 2) . '|' . $purp_norm;
             if (isset($strict_fingerprints[$strict_key])) {
+                $updateExisting($strict_fingerprints[$strict_key], $tx);
                 $skipped++;
                 continue;
             }
@@ -294,8 +318,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             $existing[] = $tx;
-            $existing_hashes[$tx['id']] = true;
-            $strict_fingerprints[$strict_key] = true;
+            $existing_hashes[$tx['id']] = count($existing) - 1;
+            $strict_fingerprints[$strict_key] = count($existing) - 1;
             $soft_fingerprints[$soft_key] = true;
             $added++;
         }
@@ -313,6 +337,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             'success'     => true,
             'added'       => $added,
             'skipped'     => $skipped,
+            'updated'     => $updated,
             'soft_dupes'  => $soft_dupes,
             'soft_list'   => $soft_dupe_list,
             'total'       => count($existing),
@@ -403,6 +428,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             </div>
         </header>
 
+        <div id="smartAlerts" class="space-y-3 mb-6"></div>
         <div id="mainContainer"></div>
 
         <div id="loadMoreContainer" class="flex justify-center gap-4 py-12 hidden">
@@ -565,7 +591,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             isPrivate: (document.getElementById('m_category').value === 'Privat'),
             notes: "", attachments: []
         };
-        transactions.push(newTx); closeModal(); render();
+        transactions.push(newTx); closeModal(); render(); autoSave();
     }
 
     // --- RENDU ---
@@ -698,18 +724,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     // ACTIONS
     function togglePriv(id, chk) {
         const tx = transactions.find(t => String(t.id) === String(id));
-        if (tx) { tx.isPrivate = chk; tx.category = chk ? 'Privat' : ''; render(); }
+        if (tx) { tx.isPrivate = chk; tx.category = chk ? 'Privat' : ''; render(); autoSave(); }
     }
     function changeCat(id, val) {
         const tx = transactions.find(t => String(t.id) === String(id));
-        if (tx) { tx.category = val; tx.isPrivate = (val === 'Privat'); render(); }
+        if (tx) { tx.category = val; tx.isPrivate = (val === 'Privat'); render(); autoSave(); }
     }
-    function updateTx(id, f, v) { const tx = transactions.find(t => String(t.id) === String(id)); if (tx) { tx[f] = v; } }
-    function deleteTx(id) { if (confirm("Supprimer ?")) { transactions = transactions.filter(t => String(t.id) !== String(id)); render(); } }
+    function updateTx(id, f, v) { const tx = transactions.find(t => String(t.id) === String(id)); if (tx) { tx[f] = v; autoSave(); } }
+    function deleteTx(id) { if (confirm("Supprimer ?")) { transactions = transactions.filter(t => String(t.id) !== String(id)); render(); autoSave(); } }
     function deletePJ(txId, filename) {
         if (!confirm("Supprimer ce fichier ?")) return;
         const tx = transactions.find(t => String(t.id) === String(txId));
-        if (tx && tx.attachments) { tx.attachments = tx.attachments.filter(f => f !== filename); render(); }
+        if (tx && tx.attachments) { tx.attachments = tx.attachments.filter(f => f !== filename); render(); autoSave(); }
     }
     async function uploadFile(file) {
         if (!file || !currentUploadTxId) return;
@@ -719,11 +745,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (data.status === 'success') {
             const tx = transactions.find(t => String(t.id) === String(currentUploadTxId));
             if (!tx.attachments) tx.attachments = [];
-            tx.attachments.push(data.filename); render();
+            tx.attachments.push(data.filename); render(); autoSave();
         }
     }
-    async function saveData() {
-        const btn = document.getElementById('saveBtn'); btn.innerText = '...';
+    // Auto-save avec debounce (500ms)
+    let _saveTimer = null;
+    let _saving = false;
+    function autoSave() {
+        clearTimeout(_saveTimer);
+        _saveTimer = setTimeout(() => _doSave(), 500);
+    }
+    async function _doSave() {
+        if (_saving) return;
+        _saving = true;
+        const btn = document.getElementById('saveBtn');
+        btn.innerText = '...';
         try {
             const res = await fetch('index.php', {
                 method: 'POST',
@@ -732,18 +768,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             });
             const data = await res.json().catch(() => ({}));
             if (res.ok && data.status !== 'error') {
-                btn.innerText = 'SAUVEGARDÉ ✅';
+                btn.innerText = 'Sauvegardé ✅';
             } else {
-                btn.innerText = '❌ ERREUR SAVE';
+                btn.innerText = '❌ ERREUR';
                 console.error('Save error:', data);
-                alert('Erreur de sauvegarde : ' + (data.msg || 'réponse inattendue'));
             }
         } catch(e) {
             btn.innerText = '❌ ERREUR';
-            alert('Erreur réseau : ' + e);
+            console.error('Save error:', e);
         }
-        setTimeout(() => btn.innerText = 'Enregistrer', 3000);
+        _saving = false;
+        setTimeout(() => btn.innerText = 'Enregistrer', 2000);
     }
+    // Bouton manuel = save immédiat
+    function saveData() { clearTimeout(_saveTimer); _doSave(); }
     // ===== IMPORT CSV + BACKUP =====
     function openImportModal() {
         document.getElementById('importStatus').classList.add('hidden');
@@ -774,7 +812,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             .then(data => {
                 if (data.success) {
                     let msg = `✅ ${data.added} transaction(s) importée(s)`;
-                    if (data.skipped > 0)     msg += ` · ${data.skipped} doublon(s) exact(s) ignoré(s)`;
+                    if (data.updated > 0)     msg += ` · ${data.updated} note(s) mise(s) à jour`;
+                    if (data.skipped > 0)     msg += ` · ${data.skipped} doublon(s) ignoré(s)`;
                     if (data.soft_dupes > 0)  msg += ` · ⚠️ ${data.soft_dupes} quasi-doublon(s)`;
                     msg += ` · Total: ${data.total}`;
                     if (data.backup)          msg += `\n💾 Backup : ${data.backup}`;
@@ -864,7 +903,107 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             .catch(e => alert('Erreur réseau : ' + e));
     }
 
+    // ===== SERVICE INTELLIGENT =====
+
+    function smartAnalyze() {
+        const alertsBox = document.getElementById('smartAlerts');
+        alertsBox.innerHTML = '';
+
+        // 1. Compter les catégories par bénéficiaire (normalisé)
+        const benCats = {}; // { beneficiary: { cat: count } }
+        transactions.forEach(tx => {
+            if (!tx.beneficiary || !tx.category) return;
+            const ben = tx.beneficiary.trim().toUpperCase();
+            if (!benCats[ben]) benCats[ben] = {};
+            benCats[ben][tx.category] = (benCats[ben][tx.category] || 0) + 1;
+        });
+
+        // 2. Auto-catégorisation : si un bénéficiaire a 3+ occurrences dans une catégorie,
+        //    proposer de catégoriser les transactions sans catégorie de ce bénéficiaire
+        const suggestions = []; // { beneficiary, category, count, targets: [indices] }
+        transactions.forEach((tx, idx) => {
+            if (tx.category) return; // déjà catégorisé
+            const ben = (tx.beneficiary || '').trim().toUpperCase();
+            if (!benCats[ben]) return;
+
+            // Trouver la catégorie dominante (3+ occurrences)
+            let bestCat = null, bestCount = 0;
+            for (const [cat, count] of Object.entries(benCats[ben])) {
+                if (count >= 3 && count > bestCount) {
+                    bestCat = cat;
+                    bestCount = count;
+                }
+            }
+            if (bestCat) {
+                let existing = suggestions.find(s => s.beneficiary === ben && s.category === bestCat);
+                if (!existing) {
+                    existing = { beneficiary: ben, category: bestCat, count: bestCount, targets: [] };
+                    suggestions.push(existing);
+                }
+                existing.targets.push(idx);
+            }
+        });
+
+        // Afficher les suggestions
+        suggestions.forEach(s => {
+            const displayBen = transactions[s.targets[0]].beneficiary;
+            const div = document.createElement('div');
+            div.className = 'bg-blue-50 border border-blue-200 rounded-lg p-4 flex items-center justify-between gap-4';
+            div.innerHTML = `
+                <div>
+                    <span class="font-black text-blue-800 text-sm">Suggestion</span>
+                    <span class="text-sm text-blue-700 ml-2">
+                        <strong>${displayBen}</strong> est catégorisé <strong>${s.category}</strong> ${s.count}x
+                        — ${s.targets.length} transaction(s) sans catégorie à mettre à jour
+                    </span>
+                </div>
+                <div class="flex gap-2 shrink-0">
+                    <button onclick="applySmartCategory('${displayBen.replace(/'/g, "\\'")}', '${s.category}', [${s.targets}]); this.closest('div.bg-blue-50').remove();"
+                            class="bg-blue-600 text-white px-4 py-1.5 rounded font-bold text-xs hover:bg-blue-700">Appliquer</button>
+                    <button onclick="this.closest('div.bg-blue-50').remove();"
+                            class="border border-blue-300 text-blue-600 px-4 py-1.5 rounded font-bold text-xs hover:bg-blue-100">Ignorer</button>
+                </div>
+            `;
+            alertsBox.appendChild(div);
+        });
+
+        // 3. Alerte conflit : bénéficiaire dans plusieurs catégories différentes
+        const conflicts = [];
+        for (const [ben, cats] of Object.entries(benCats)) {
+            const catEntries = Object.entries(cats).filter(([c, n]) => c && c !== 'Privat' && c !== 'Sonstiges');
+            if (catEntries.length >= 2) {
+                const displayBen = transactions.find(t => t.beneficiary && t.beneficiary.trim().toUpperCase() === ben)?.beneficiary || ben;
+                conflicts.push({
+                    beneficiary: displayBen,
+                    categories: catEntries.map(([c, n]) => `${c} (${n}x)`).join(', ')
+                });
+            }
+        }
+
+        if (conflicts.length > 0) {
+            const div = document.createElement('div');
+            div.className = 'bg-amber-50 border border-amber-300 rounded-lg p-4';
+            div.innerHTML = `
+                <p class="font-black text-amber-800 text-sm mb-2">Conflits de catégorie détectés</p>
+                <ul class="text-xs text-amber-700 space-y-1">
+                    ${conflicts.map(c => `<li><strong>${c.beneficiary}</strong> : ${c.categories}</li>`).join('')}
+                </ul>
+            `;
+            alertsBox.appendChild(div);
+        }
+    }
+
+    function applySmartCategory(beneficiary, category, indices) {
+        indices.forEach(idx => {
+            transactions[idx].category = category;
+            if (category === 'Privat') transactions[idx].isPrivate = true;
+        });
+        render(); autoSave();
+        // Ne pas rappeler smartAnalyze ici, render() le fait déjà
+    }
+
     render();
+    smartAnalyze();
 </script>
 </body>
 </html>
