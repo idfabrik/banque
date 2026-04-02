@@ -42,6 +42,7 @@ class CSVParserService {
             'datev_extf' => $this->parseDatevExtf($lines),
             'datev' => $this->parseDatev($lines),
             'dkb' => $this->parseDkb($lines),
+            'ing' => $this->parseIng($lines),
             default => []
         };
         
@@ -58,6 +59,8 @@ class CSVParserService {
                 return 'datev';
             } elseif (strpos($lines[$i], 'Buchungsdatum') !== false) {
                 return 'dkb';
+            } elseif (strpos($lines[$i], 'Buchung;Wertstellungsdatum') !== false) {
+                return 'ing';
             }
         }
         return 'unknown';
@@ -203,10 +206,30 @@ class CSVParserService {
             $cols = str_getcsv($line, ';');
             if (count($cols) < 9) continue;
             
-            $date = trim($cols[0], '" ');
-            $status = trim($cols[2], '" ');
-            $beneficiary = trim($cols[4], '" ');
-            $purpose = trim($cols[5], '" ');
+            $date        = trim($cols[0], '" ');
+            $status      = trim($cols[2], '" ');
+            $counterpart = trim($cols[3], '" ');
+            $col4        = trim($cols[4] ?? '', '" ');
+            $purpose     = trim($cols[5] ?? '', '" ');
+            $direction   = trim($cols[6] ?? '', '" '); // "Eingang" = revenu entrant
+
+            // DKB met parfois "ISSUER" ou une valeur vide/technique en col[3]
+            // pour les paiements par carte ou Lastschrift.
+            // Priorité : col[3] si nom réel, sinon col[4], sinon extraire du purpose.
+            $dkb_placeholders = ['ISSUER', 'IBAN', 'BIC', 'SEPA', ''];
+            if (in_array(strtoupper($counterpart), $dkb_placeholders)) {
+                // Essayer col[4]
+                if (!empty($col4) && !in_array(strtoupper($col4), $dkb_placeholders)) {
+                    $beneficiary = $col4;
+                } else {
+                    // Extraire le premier segment lisible du purpose (avant le premier /)
+                    $parts = preg_split('/\s{2,}|\/|\|/', $purpose, 2);
+                    $beneficiary = !empty(trim($parts[0])) ? trim($parts[0]) : $purpose;
+                }
+            } else {
+                $beneficiary = $counterpart;
+            }
+
             $amount = trim($cols[8], '" ');
             
             if ($status !== 'Gebucht') continue;
@@ -231,7 +254,71 @@ class CSVParserService {
         
         return $transactions;
     }
-    
+
+    /**
+     * Parser ING (format CSV export ING-DiBa)
+     * Colonnes: Buchung;Wertstellungsdatum;Auftraggeber/Empfänger;Buchungstext;Verwendungszweck;Saldo;Währung;Betrag;Währung
+     * Index:    0      ;1                  ;2                      ;3            ;4                ;5     ;6      ;7      ;8
+     */
+    private function parseIng(array $lines): array {
+        $transactions = [];
+        $header_idx = null;
+
+        // Trouver la ligne d'en-tête
+        for ($i = 0; $i < count($lines); $i++) {
+            if (strpos($lines[$i], 'Buchung;Wertstellungsdatum') !== false) {
+                $header_idx = $i;
+                break;
+            }
+        }
+
+        if ($header_idx === null) return [];
+
+        for ($i = $header_idx + 1; $i < count($lines); $i++) {
+            $line = trim($lines[$i]);
+            if (empty($line)) continue;
+
+            $cols = str_getcsv($line, ';');
+            if (count($cols) < 8) continue;
+
+            $date        = trim($cols[0], '" ');
+            $beneficiary = trim($cols[2], '" ');
+            $buchungstext = trim($cols[3], '" ');
+            $purpose     = trim($cols[4], '" ');
+            $amount_str  = trim($cols[7], '" ');
+
+            if (empty($date) || empty($amount_str)) continue;
+
+            // Si pas de bénéficiaire, utiliser le Buchungstext (ex: "Abschluss")
+            if (empty($beneficiary)) {
+                $beneficiary = !empty($buchungstext) ? $buchungstext : 'Inconnu';
+            }
+
+            // Convertir montant allemand → float
+            $amount_str = str_replace('.', '', $amount_str);
+            $amount_str = str_replace(',', '.', $amount_str);
+            $amount = floatval($amount_str);
+
+            if ($amount == 0) continue;
+
+            // La date ING est déjà en DD.MM.YYYY → formatDate la gère
+            $date_str = $this->formatDate($date, intval(date('Y')));
+
+            $tx = $this->createTransaction(
+                date: $date_str,
+                beneficiary: $beneficiary,
+                purpose: $purpose,
+                montant: $amount,
+                attachments: []
+            );
+
+            $tx['id'] = $this->generateUniqueHash($tx);
+            $transactions[] = $tx;
+        }
+
+        return $transactions;
+    }
+
     /**
      * ✅ AMÉLIORE: Extraire l'année et toujours retourner 4 chiffres
      */

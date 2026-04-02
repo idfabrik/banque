@@ -11,8 +11,10 @@ $transactions_array = json_decode($initial_data_raw, true) ?: [];
 // Catégories (pour CSVParserService + select UI)
 $categories_map = [
     'REVENUE' => [
-        'Dienstleistungen' => ['AUSZAHLUNG', 'UEBERWEISUNG', 'TRANSFER', 'ZAHLUNG', 'ENTGELT', 'HONORAR'],
-        'Versand/Provision' => ['PAYPAL', 'STRIPE', 'AMAZON', 'EBAY'],
+        'Einnahme Deutschland'     => ['ZAHLUNG', 'UEBERWEISUNG', 'ENTGELT', 'HONORAR', 'AUSZAHLUNG'],
+        'Einnahme EU'              => ['VIREMENT', 'SEPA', 'EUROPEAN', 'EINGANG EU'],
+        'Einnahme International'   => ['WIRE', 'SWIFT', 'INTERNATIONAL', 'USD', 'TRANSFERWISE', 'WISE'],
+        'Versand/Provision'        => ['PAYPAL', 'STRIPE', 'AMAZON', 'EBAY'],
     ],
     'EXPENSES' => [
         'Bezogene Fremdleistungen' => ['FREELANCER', 'SUBUNTERNEHMER', 'AGENTUR', 'DESIGNER'],
@@ -33,7 +35,29 @@ $categories_map = [
     ]
 ];
 
-$categories_list = ["Privat", "Dienstleistungen", "Telekommunikation", "Reisekosten", "Werbekosten", "Büromaterial", "Hardware", "Software/SaaS", "Versicherungen", "Miete/Pacht", "Bankgebühren", "Sonstiges"];
+$categories_list = [
+    // Revenus
+    'Einnahme Deutschland',
+    'Einnahme EU',
+    'Einnahme International',
+    // Dépenses
+    'Bezogene Fremdleistungen',
+    'Telekommunikation',
+    'Reisekosten',
+    'Werbekosten',
+    'Büromaterial',
+    'Hardware',
+    'Software/SaaS',
+    'Versicherungen',
+    'Miete/Pacht',
+    'Bankgebühren',
+    'Steuern',
+    'Bewirtungsaufwendungen',
+    'Fortbildungskosten',
+    // Divers
+    'Privat',
+    'Sonstiges',
+];
 foreach ($transactions_array as $tx) {
     if (!empty($tx['category']) && !in_array($tx['category'], $categories_list)) {
         $categories_list[] = $tx['category'];
@@ -51,6 +75,25 @@ function get_next_id(): int {
     return $max + 1;
 }
 
+// ===== BACKUPS DIR =====
+$backups_dir = __DIR__ . '/backups';
+if (!is_dir($backups_dir)) mkdir($backups_dir, 0755, true);
+
+// Lister les backups (GET) — hors du bloc POST
+if ($_SERVER['REQUEST_METHOD'] === 'GET' && isset($_GET['action']) && $_GET['action'] === 'list_backups') {
+    $files = glob($backups_dir . '/data_*.json');
+    usort($files, fn($a, $b) => filemtime($b) - filemtime($a));
+    $list = array_map(fn($f) => [
+        'name'    => basename($f),
+        'size'    => round(filesize($f) / 1024, 1),
+        'date'    => date('d.m.Y H:i:s', filemtime($f)),
+        'records' => count(json_decode(file_get_contents($f), true) ?: [])
+    ], array_slice($files, 0, 20));
+    header('Content-Type: application/json');
+    echo json_encode($list);
+    exit;
+}
+
 // API LOGIQUE
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
@@ -62,6 +105,106 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (move_uploaded_file($_FILES['file']['tmp_name'], $uploads_dir . '/' . $filename)) {
             echo json_encode(['status' => 'success', 'filename' => $filename]);
         }
+        exit;
+    }
+
+    // Restaurer un backup
+    if (isset($_POST['action']) && $_POST['action'] === 'restore_backup') {
+        $name = basename($_POST['backup'] ?? '');
+        $src  = $backups_dir . '/' . $name;
+        if ($name && file_exists($src) && str_starts_with($name, 'data_') && str_ends_with($name, '.json')) {
+            // Sauvegarder l'état actuel avant de restaurer
+            $stamp = date('Y-m-d_H-i-s');
+            copy($json_file, $backups_dir . "/data_{$stamp}_before_restore.json");
+            copy($src, $json_file);
+            echo json_encode(['success' => true, 'restored' => $name]);
+        } else {
+            echo json_encode(['success' => false, 'error' => 'Fichier invalide']);
+        }
+        exit;
+    }
+
+    // Nettoyage des doublons
+    if (isset($_POST['action']) && $_POST['action'] === 'deduplicate') {
+        $existing = json_decode(file_get_contents($json_file), true) ?: [];
+
+        // Backup avant nettoyage
+        $stamp = date('Y-m-d_H-i-s');
+        copy($json_file, $backups_dir . "/data_{$stamp}_before_dedup.json");
+
+        // Regrouper par empreinte (date + montant + bénéficiaire normalisé)
+        // Pour chaque groupe, on compare les purpose pour distinguer les vrais doublons
+        // des achats légitimement identiques (ex: 2x Steinecke le même jour)
+        $groups = [];
+        foreach ($existing as $idx => $tx) {
+            $ben_norm = strtoupper(preg_replace('/[^A-Z0-9]/i', '', $tx['beneficiary'] ?? ''));
+            $key = $tx['date'] . '|' . round(floatval($tx['amount']), 2) . '|' . $ben_norm;
+            $groups[$key][] = $idx;
+        }
+
+        $cleaned = [];
+        $removed = [];
+        $dominated = []; // indices à exclure
+
+        foreach ($groups as $key => $indices) {
+            if (count($indices) <= 1) continue; // pas de doublon
+
+            // Sous-grouper par purpose normalisé pour ne pas fusionner des transactions distinctes
+            $by_purpose = [];
+            foreach ($indices as $idx) {
+                $purpose_norm = strtoupper(preg_replace('/[^A-Z0-9]/i', '', $existing[$idx]['purpose'] ?? ''));
+                // Si purpose vide → clé spéciale pour les regrouper ensemble
+                $pkey = $purpose_norm ?: '__EMPTY__';
+                $by_purpose[$pkey][] = $idx;
+            }
+
+            foreach ($by_purpose as $pkey => $sub_indices) {
+                if (count($sub_indices) <= 1) continue;
+
+                // Vrais doublons : même date+montant+bénéficiaire+purpose → garder le meilleur
+                $best_idx = $sub_indices[0];
+                $best_score = 0;
+                foreach ($sub_indices as $idx) {
+                    $tx = $existing[$idx];
+                    $score = (count($tx['attachments'] ?? []) * 10)
+                        + (strlen($tx['notes'] ?? '') > 0 ? 5 : 0)
+                        + (strlen($tx['category'] ?? '') > 0 ? 2 : 0)
+                        + (strlen($tx['purpose'] ?? '') > 0 ? 1 : 0);
+                    if ($score > $best_score) {
+                        $best_score = $score;
+                        $best_idx = $idx;
+                    }
+                }
+                // Marquer les autres comme doublons
+                foreach ($sub_indices as $idx) {
+                    if ($idx !== $best_idx) {
+                        $dominated[$idx] = true;
+                        $tx = $existing[$idx];
+                        $removed[] = ['id' => $tx['numeric_id'] ?? '', 'date' => $tx['date'], 'beneficiary' => $tx['beneficiary'], 'amount' => $tx['amount']];
+                    }
+                }
+            }
+        }
+
+        foreach ($existing as $idx => $tx) {
+            if (!isset($dominated[$idx])) {
+                $cleaned[] = $tx;
+            }
+        }
+
+        $json_output = json_encode($cleaned, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($json_output !== false) {
+            file_put_contents($json_file, $json_output);
+        }
+
+        header('Content-Type: application/json');
+        echo json_encode([
+            'success' => true,
+            'before'  => count($existing),
+            'after'   => count($cleaned),
+            'removed' => count($removed),
+            'details' => array_slice($removed, 0, 50)
+        ]);
         exit;
     }
 
@@ -80,34 +223,117 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $new_transactions = $parser->parse($content);
 
         if (empty($new_transactions)) {
-            echo json_encode(['success' => false, 'error' => 'Format non reconnu ou fichier vide (EXTF, Datev, DKB supportés)']);
+            echo json_encode(['success' => false, 'error' => 'Format non reconnu ou fichier vide (EXTF, Datev, DKB, ING supportés)']);
             exit;
         }
 
-        // Charger données existantes et dédupliquer par hash id
-        $existing = json_decode(file_get_contents($json_file), true) ?: [];
-        $existing_hashes = array_column($existing, 'id');
+        // ✅ BACKUP avant toute modification
+        $stamp = date('Y-m-d_H-i-s');
+        $backup_file = $backups_dir . "/data_{$stamp}.json";
+        copy($json_file, $backup_file);
 
-        $added = 0;
-        foreach ($new_transactions as $tx) {
-            if (!in_array($tx['id'], $existing_hashes)) {
-                // Adapter le format pour la v19 (mwst au lieu de tva)
-                $tx['mwst'] = $tx['tva'] ?? 19;
-                $tx['isPrivate'] = ($tx['category'] === 'Privat');
-                $existing[] = $tx;
-                $added++;
-            }
+        // Charger données existantes
+        $existing = json_decode(file_get_contents($json_file), true) ?: [];
+
+        // Index de déduplication
+        // 1. Hash exact (SHA-256 sur date+montant+bénéficiaire+objet+type)
+        $existing_hashes = array_fill_keys(array_column($existing, 'id'), true);
+
+        // 2. Empreinte semi-stricte (date + montant + bénéficiaire + purpose normalisés) → BLOQUE l'import
+        //    Protège contre les réimports cross-banque ou après changement de parser
+        //    Inclut le purpose pour ne pas bloquer 2 achats identiques le même jour (purpose différent)
+        $strict_fingerprints = [];
+        foreach ($existing as $tx) {
+            $ben_norm = strtoupper(preg_replace('/[^A-Z0-9]/i', '', $tx['beneficiary'] ?? ''));
+            $purp_norm = strtoupper(preg_replace('/[^A-Z0-9]/i', '', $tx['purpose'] ?? ''));
+            $key = $tx['date'] . '|' . round(floatval($tx['amount']), 2) . '|' . $ben_norm . '|' . $purp_norm;
+            $strict_fingerprints[$key] = true;
         }
 
-        file_put_contents($json_file, json_encode($existing));
-        echo json_encode(['success' => true, 'added' => $added, 'total' => count($existing), 'skipped' => count($new_transactions) - $added]);
+        // 3. Empreinte souple (date + montant arrondi) → importer mais signaler en jaune
+        $soft_fingerprints = [];
+        foreach ($existing as $tx) {
+            $key = $tx['date'] . '|' . round(floatval($tx['amount']), 2);
+            $soft_fingerprints[$key] = true;
+        }
+
+        $added      = 0;
+        $skipped    = 0;
+        $soft_dupes = 0;
+        $soft_dupe_list = [];
+
+        foreach ($new_transactions as $tx) {
+            $tx['mwst']      = $tx['tva'] ?? 19;
+            $tx['isPrivate'] = ($tx['category'] === 'Privat');
+
+            // Doublon exact (hash) → ignorer
+            if (isset($existing_hashes[$tx['id']])) {
+                $skipped++;
+                continue;
+            }
+
+            // Doublon semi-strict (date + montant + bénéficiaire + purpose) → ignorer
+            $ben_norm = strtoupper(preg_replace('/[^A-Z0-9]/i', '', $tx['beneficiary'] ?? ''));
+            $purp_norm = strtoupper(preg_replace('/[^A-Z0-9]/i', '', $tx['purpose'] ?? ''));
+            $strict_key = $tx['date'] . '|' . round(floatval($tx['amount']), 2) . '|' . $ben_norm . '|' . $purp_norm;
+            if (isset($strict_fingerprints[$strict_key])) {
+                $skipped++;
+                continue;
+            }
+
+            // Doublon souple (date + montant, bénéficiaire différent) → importer mais marquer
+            $soft_key = $tx['date'] . '|' . round(floatval($tx['amount']), 2);
+            if (isset($soft_fingerprints[$soft_key])) {
+                $tx['_soft_dupe'] = true;
+                $soft_dupes++;
+                $soft_dupe_list[] = [
+                    'date'        => $tx['date'],
+                    'amount'      => $tx['amount'],
+                    'beneficiary' => $tx['beneficiary']
+                ];
+            }
+
+            $existing[] = $tx;
+            $existing_hashes[$tx['id']] = true;
+            $strict_fingerprints[$strict_key] = true;
+            $soft_fingerprints[$soft_key] = true;
+            $added++;
+        }
+
+        // Encoder en JSON — protéger contre les erreurs d'encodage qui videraient data.json
+        $json_output = json_encode($existing, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($json_output === false) {
+            // Restaurer depuis le backup si json_encode échoue
+            copy($backup_file, $json_file);
+            echo json_encode(['success' => false, 'error' => 'Erreur encodage JSON: ' . json_last_error_msg() . ' — backup conservé.']);
+            exit;
+        }
+        file_put_contents($json_file, $json_output);
+        echo json_encode([
+            'success'     => true,
+            'added'       => $added,
+            'skipped'     => $skipped,
+            'soft_dupes'  => $soft_dupes,
+            'soft_list'   => $soft_dupe_list,
+            'total'       => count($existing),
+            'backup'      => basename($backup_file)
+        ]);
         exit;
     }
 
     // Sauvegarde JSON standard
     $body = file_get_contents('php://input');
-    if ($body && json_decode($body) !== null) {
-        file_put_contents($json_file, $body);
+    $decoded = $body ? json_decode($body, true) : null;
+    if ($decoded !== null && is_array($decoded)) {
+        // Re-encoder proprement pour garantir un JSON valide et bien encodé
+        $safe = json_encode($decoded, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        if ($safe !== false) {
+            file_put_contents($json_file, $safe);
+            echo json_encode(['status' => 'ok']);
+        } else {
+            http_response_code(500);
+            echo json_encode(['status' => 'error', 'msg' => 'Encodage JSON échoué: ' . json_last_error_msg()]);
+        }
     }
     exit;
 }
@@ -172,6 +398,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     <option value="amount_asc">Montant ↑</option>
                 </select>
 
+                <button onclick="deduplicateData()" class="bg-red-50 text-red-600 border border-red-200 px-4 py-2 rounded-lg font-bold text-xs hover:bg-red-100">Nettoyer doublons</button>
                 <button onclick="saveData()" id="saveBtn" class="bg-black text-white px-8 py-2 rounded-lg font-bold text-xs uppercase">Enregistrer</button>
             </div>
         </header>
@@ -203,7 +430,22 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     <div><label class="block text-[10px] font-bold text-gray-400">Montant Brut (€)</label><input type="number" step="0.01" id="m_amount" required class="w-full border rounded p-2 text-sm"></div>
                     <div><label class="block text-[10px] font-bold text-gray-400">TVA / MwSt</label><select id="m_mwst" class="w-full border rounded p-2 text-sm"><option value="19">19%</option><option value="7">7%</option><option value="0">0%</option></select></div>
                 </div>
-                <div><label class="block text-[10px] font-bold text-gray-400">Catégorie</label><select id="m_category" class="w-full border rounded p-2 text-sm"><?php foreach($categories_list as $cat): ?><option value="<?= $cat ?>"><?= $cat ?></option><?php endforeach; ?></select></div>
+                <div><label class="block text-[10px] font-bold text-gray-400">Catégorie</label><select id="m_category" class="w-full border rounded p-2 text-sm">
+  <optgroup label="── Revenus ──">
+    <option value="Einnahme Deutschland">Einnahme Deutschland</option>
+    <option value="Einnahme EU">Einnahme EU</option>
+    <option value="Einnahme International">Einnahme International</option>
+  </optgroup>
+  <optgroup label="── Dépenses ──">
+    <?php foreach($categories_list as $cat): if (in_array($cat, ['Einnahme Deutschland','Einnahme EU','Einnahme International','Privat','Sonstiges'])) continue; ?>
+    <option value="<?= $cat ?>"><?= $cat ?></option>
+    <?php endforeach; ?>
+  </optgroup>
+  <optgroup label="── Divers ──">
+    <option value="Privat">Privat</option>
+    <option value="Sonstiges">Sonstiges</option>
+  </optgroup>
+</select></div>
                 <div class="flex gap-3 pt-4">
                     <button type="button" onclick="closeModal()" class="flex-1 border py-2 rounded-lg font-bold text-gray-400">Annuler</button>
                     <button type="submit" class="flex-1 bg-black text-white py-2 rounded-lg font-bold">Ajouter</button>
@@ -216,12 +458,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     <!-- MODAL IMPORT CSV -->
     <div id="importModal" class="modal">
-        <div class="modal-content" style="max-width:520px;">
+        <div class="modal-content" style="max-width:560px;">
             <h2 class="text-xl font-black mb-1 border-b pb-2">⬆ Import CSV bancaire</h2>
-            <p class="text-xs text-gray-400 mb-4">Formats supportés : DATEV EXTF · DATEV · DKB<br>Les doublons sont automatiquement ignorés (déduplication par hash).</p>
+            <p class="text-xs text-gray-400 mb-4">Formats supportés : DATEV EXTF · DATEV · DKB · ING &nbsp;·&nbsp; Un backup automatique est créé avant chaque import.</p>
 
+            <!-- Drop zone -->
             <div id="importDropZone"
-                 class="border-2 border-dashed border-gray-300 rounded-xl p-10 text-center cursor-pointer transition-all hover:border-[#00c47f] hover:bg-green-50"
+                 class="border-2 border-dashed border-gray-300 rounded-xl p-8 text-center cursor-pointer transition-all hover:border-[#00c47f] hover:bg-green-50"
                  onclick="document.getElementById('csvFilePicker').click()"
                  ondragover="event.preventDefault(); this.classList.add('border-[#00c47f]','bg-green-50');"
                  ondragleave="this.classList.remove('border-[#00c47f]','bg-green-50');"
@@ -232,7 +475,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <input type="file" id="csvFilePicker" accept=".csv" class="hidden" onchange="handleCSVInput(this.files[0])">
             </div>
 
+            <!-- Status -->
             <div id="importStatus" class="hidden mt-4 p-3 rounded-lg text-sm font-bold"></div>
+
+            <!-- Soft dupes warning -->
+            <div id="softDupesBox" class="hidden mt-3 p-3 bg-yellow-50 border border-yellow-200 rounded-lg text-xs text-yellow-800">
+                <p class="font-black mb-1">⚠️ Transactions avec date+montant identiques déjà présentes (importées quand même — vérifier)&nbsp;:</p>
+                <ul id="softDupesList" class="list-disc pl-4 space-y-0.5 mt-1 font-mono"></ul>
+            </div>
+
+            <!-- Backup panel -->
+            <div class="mt-5 border-t pt-4">
+                <div class="flex justify-between items-center mb-2">
+                    <p class="text-xs font-black text-gray-500 uppercase tracking-wide">🗂 Backups disponibles</p>
+                    <button onclick="loadBackups()" class="text-xs text-[#00c47f] font-bold hover:underline bg-transparent border-0 p-0">↺ Rafraîchir</button>
+                </div>
+                <div id="backupList" class="text-xs text-gray-400 italic">Cliquer sur "Rafraîchir" pour charger.</div>
+            </div>
 
             <div class="flex gap-3 mt-5">
                 <button type="button" onclick="closeImportModal()" class="flex-1 border py-2 rounded-lg font-bold text-gray-400">Fermer</button>
@@ -419,7 +678,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                     </select></td>
                     <td class="text-right ${t.type === 'Entrée' ? 'amt-recette' : 'amt-depense'}">${parseFloat(t.amount || 0).toFixed(2)}€</td>
                     <td><select onchange="changeCat('${t.id}', this.value)" class="text-[10px] w-full font-bold outline-none bg-transparent">
-                        <option value="">Choisir</option>${categories.map(c => `<option value="${c}" ${t.category === c ? 'selected' : ''}>${c}</option>`).join('')}
+                        <option value="">Choisir</option>
+                        <optgroup label="Revenus">${['Einnahme Deutschland','Einnahme EU','Einnahme International'].map(c => `<option value="${c}" ${t.category === c ? 'selected' : ''}>${c}</option>`).join('')}</optgroup>
+                        <optgroup label="Dépenses">${categories.filter(c => !['Einnahme Deutschland','Einnahme EU','Einnahme International','Privat','Sonstiges'].includes(c)).map(c => `<option value="${c}" ${t.category === c ? 'selected' : ''}>${c}</option>`).join('')}</optgroup>
+                        <optgroup label="Divers">${['Privat','Sonstiges'].map(c => `<option value="${c}" ${t.category === c ? 'selected' : ''}>${c}</option>`).join('')}</optgroup>
                     </select></td>
                     <td><div class="flex flex-wrap gap-1">
                         ${(t.attachments || []).map(f => `<div class="pj-badge"><a href="uploads/${f}" target="_blank">Pj</a><span class="pj-del" onclick="deletePJ('${t.id}', '${f}')">✕</span></div>`).join('')}
@@ -461,14 +723,33 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         }
     }
     async function saveData() {
-        const btn = document.getElementById('saveBtn'); btn.innerText = "...";
-        await fetch('index.php', { method: 'POST', body: JSON.stringify(transactions) });
-        btn.innerText = "SAUVEGARDÉ ✅"; setTimeout(() => btn.innerText = "Enregistrer", 2000);
+        const btn = document.getElementById('saveBtn'); btn.innerText = '...';
+        try {
+            const res = await fetch('index.php', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(transactions)
+            });
+            const data = await res.json().catch(() => ({}));
+            if (res.ok && data.status !== 'error') {
+                btn.innerText = 'SAUVEGARDÉ ✅';
+            } else {
+                btn.innerText = '❌ ERREUR SAVE';
+                console.error('Save error:', data);
+                alert('Erreur de sauvegarde : ' + (data.msg || 'réponse inattendue'));
+            }
+        } catch(e) {
+            btn.innerText = '❌ ERREUR';
+            alert('Erreur réseau : ' + e);
+        }
+        setTimeout(() => btn.innerText = 'Enregistrer', 3000);
     }
-    // ===== IMPORT CSV =====
+    // ===== IMPORT CSV + BACKUP =====
     function openImportModal() {
         document.getElementById('importStatus').classList.add('hidden');
+        document.getElementById('softDupesBox').classList.add('hidden');
         document.getElementById('importModal').style.display = 'flex';
+        loadBackups();
     }
     function closeImportModal() {
         document.getElementById('importModal').style.display = 'none';
@@ -478,7 +759,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     function handleCSVInput(file) { if (file) importCSV(file); }
 
     function importCSV(file) {
-        const status = document.getElementById('importStatus');
+        const status    = document.getElementById('importStatus');
+        const softBox   = document.getElementById('softDupesBox');
+        softBox.classList.add('hidden');
         status.className = 'mt-4 p-3 rounded-lg text-sm font-bold bg-gray-100 text-gray-600';
         status.classList.remove('hidden');
         status.innerText = '⏳ Import en cours…';
@@ -490,14 +773,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             .then(r => r.json())
             .then(data => {
                 if (data.success) {
-                    status.className = 'mt-4 p-3 rounded-lg text-sm font-bold bg-green-100 text-green-800';
-                    status.innerText = `✅ ${data.added} transaction(s) importée(s)${data.skipped > 0 ? ' · ' + data.skipped + ' doublon(s) ignoré(s)' : ''} · Total: ${data.total}`;
-                    // Recharger les données sans reloader la page
-                    fetch('index.php').then(r => r.text()).then(() => {
-                        fetch('index.php', { headers: {'Accept':'application/json'} });
-                    });
-                    // Simple reload après 2s pour afficher les nouvelles transactions
-                    setTimeout(() => { closeImportModal(); location.reload(); }, 2200);
+                    let msg = `✅ ${data.added} transaction(s) importée(s)`;
+                    if (data.skipped > 0)     msg += ` · ${data.skipped} doublon(s) exact(s) ignoré(s)`;
+                    if (data.soft_dupes > 0)  msg += ` · ⚠️ ${data.soft_dupes} quasi-doublon(s)`;
+                    msg += ` · Total: ${data.total}`;
+                    if (data.backup)          msg += `\n💾 Backup : ${data.backup}`;
+
+                    status.className = 'mt-4 p-3 rounded-lg text-sm font-bold bg-green-100 text-green-800 whitespace-pre-line';
+                    status.innerText = msg;
+
+                    // Afficher quasi-doublons si présents
+                    if (data.soft_dupes > 0 && data.soft_list && data.soft_list.length) {
+                        const ul = document.getElementById('softDupesList');
+                        ul.innerHTML = data.soft_list.map(d =>
+                            `<li>${d.date} · ${parseFloat(d.amount).toFixed(2)}€ · ${d.beneficiary}</li>`
+                        ).join('');
+                        softBox.classList.remove('hidden');
+                    }
+
+                    loadBackups();
+                    setTimeout(() => { closeImportModal(); location.reload(); }, 3000);
                 } else {
                     status.className = 'mt-4 p-3 rounded-lg text-sm font-bold bg-red-100 text-red-800';
                     status.innerText = '❌ ' + (data.error || 'Erreur inconnue');
@@ -507,6 +802,66 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 status.className = 'mt-4 p-3 rounded-lg text-sm font-bold bg-red-100 text-red-800';
                 status.innerText = '❌ Erreur réseau : ' + e;
             });
+    }
+
+    // Charger la liste des backups
+    function loadBackups() {
+        const box = document.getElementById('backupList');
+        box.innerHTML = '<span class="italic text-gray-300">Chargement…</span>';
+        fetch('index.php?action=list_backups')
+            .then(r => r.json())
+            .then(list => {
+                if (!list.length) { box.innerHTML = '<span class="italic">Aucun backup.</span>'; return; }
+                box.innerHTML = list.map(b => `
+                    <div class="flex items-center justify-between py-1 border-b border-gray-100 gap-2">
+                        <span class="font-mono text-gray-500 truncate" style="max-width:300px;" title="${b.name}">${b.date}</span>
+                        <span class="text-gray-400">${b.records} entrées · ${b.size} Ko</span>
+                        <button onclick="restoreBackup('${b.name}')"
+                                class="text-red-400 hover:text-red-700 font-black text-xs border border-red-200 rounded px-2 py-0.5 hover:bg-red-50 bg-transparent">
+                            Restaurer
+                        </button>
+                    </div>
+                `).join('');
+            })
+            .catch(() => { box.innerHTML = '<span class="text-red-400">Erreur de chargement.</span>'; });
+    }
+
+    // Restaurer un backup
+    function restoreBackup(name) {
+        if (!confirm(`⚠️ Restaurer "${name}" ?\n\nL'état actuel sera sauvegardé automatiquement avant la restauration.`)) return;
+        const form = new FormData();
+        form.append('action', 'restore_backup');
+        form.append('backup', name);
+        fetch('index.php', { method: 'POST', body: form })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) { alert('✅ Restauré. La page va recharger.'); location.reload(); }
+                else alert('❌ Erreur : ' + data.error);
+            });
+    }
+
+    function deduplicateData() {
+        if (!confirm('Nettoyer les doublons ?\n\nUn backup sera créé automatiquement.\nLes doublons (même date + montant + bénéficiaire) seront supprimés.\nLa version avec le plus d\'infos (PJ, notes, catégorie) est conservée.')) return;
+        const form = new FormData();
+        form.append('action', 'deduplicate');
+        fetch('index.php', { method: 'POST', body: form })
+            .then(r => r.json())
+            .then(data => {
+                if (data.success) {
+                    let msg = `${data.removed} doublon(s) supprimé(s) (${data.before} → ${data.after} transactions)`;
+                    if (data.details && data.details.length > 0) {
+                        msg += '\n\nSupprimés :';
+                        data.details.forEach(d => {
+                            msg += `\n  ID ${d.id} | ${d.date} | ${d.beneficiary} | ${d.amount}€`;
+                        });
+                    }
+                    alert(msg);
+                    if (data.removed > 0) location.reload();
+                } else {
+                    alert('Erreur : ' + (data.error || 'inconnue'));
+                }
+            })
+            .catch(e => alert('Erreur réseau : ' + e));
     }
 
     render();
