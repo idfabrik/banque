@@ -1,4 +1,6 @@
 <?php
+session_start();
+
 $json_file = __DIR__ . '/data.json';
 $uploads_dir = __DIR__ . '/uploads';
 
@@ -123,6 +125,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         } else {
             echo json_encode(['success' => false, 'error' => 'Fichier invalide']);
         }
+        exit;
+    }
+
+    // Mémoriser l'état "liste déroulée" (bouton +Voir plus / Voir tous)
+    if (isset($_POST['action']) && $_POST['action'] === 'set_months_shown') {
+        $_SESSION['months_shown'] = max(2, intval($_POST['value'] ?? 2));
+        echo json_encode(['success' => true]);
         exit;
     }
 
@@ -368,7 +377,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 <html lang="fr">
 <head>
     <meta charset="UTF-8">
-    <title>Compta Ledger Pro v19</title>
+    <title>Compta Ledger Pro v19.2</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
         body { background-color: #f3f4f6; color: #1a1a1a; font-family: ui-sans-serif, system-ui, sans-serif; text-transform: none; }
@@ -391,6 +400,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         .modal { display: none; position: fixed; z-index: 50; inset: 0; background: rgba(0,0,0,0.5); align-items: center; justify-content: center; }
         .modal-content { background: white; padding: 2rem; border-radius: 12px; width: 100%; max-width: 550px; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.2); max-height: 90vh; overflow-y: auto; }
         button, input, select, label { text-transform: none !important; }
+        .tracking-tighter { letter-spacing: 0 !important; }
     </style>
 </head>
 <body class="p-4 md:p-8">
@@ -408,14 +418,20 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 <button onclick="openImportModal()" class="bg-gray-800 text-white px-5 py-2 rounded-lg font-bold flex items-center gap-2 hover:opacity-90">
                     ⬆ Import CSV
                 </button>
+                <button onclick="showQuarterlyTaxSummary()" class="bg-blue-600 text-white px-5 py-2 rounded-lg font-bold flex items-center gap-2 hover:opacity-90">
+                    📊 Résumé Fiscal
+                </button>
                 <label class="flex items-center gap-2 text-xs font-bold cursor-pointer bg-gray-50 px-3 py-2 rounded border border-gray-200">
                     <input type="checkbox" id="hidePrivateToggle" onchange="render()" class="w-4 h-4 accent-[#00c47f]"> Masquer privé
                 </label>
                 <label class="flex items-center gap-2 text-xs font-bold cursor-pointer bg-gray-50 px-3 py-2 rounded border border-gray-200">
                     <input type="checkbox" id="onlyRevenueToggle" onchange="render()" class="w-4 h-4 accent-[#00c47f]"> Recettes uniquement
                 </label>
+                <label class="flex items-center gap-2 text-xs font-bold cursor-pointer bg-gray-50 px-3 py-2 rounded border border-gray-200">
+                    <input type="checkbox" id="onlyNoCategoryToggle" onchange="render()" class="w-4 h-4 accent-[#00c47f]"> Sans catégorie
+                </label>
                 <input type="text" id="searchInput" oninput="resetView(); render();" placeholder="Chercher..." class="border rounded px-4 py-2 text-sm outline-none w-48 focus:ring-1 focus:ring-[#00c47f]">
-                
+
                 <select id="sortSelect" onchange="render()" class="border rounded px-2 py-2 text-sm bg-white cursor-pointer outline-none focus:ring-1 focus:ring-black">
                     <option value="date_desc">Date récente</option>
                     <option value="date_asc">Date ancienne</option>
@@ -525,11 +541,23 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         </div>
     </div>
 
+    <!-- MODAL RÉSUMÉ FISCAL -->
+    <div id="taxModal" class="modal">
+        <div class="modal-content" style="max-width:600px;">
+            <h2 class="text-xl font-black mb-1 border-b pb-2 italic">Résumé Fiscal Trimestriel</h2>
+            <p class="text-[10px] text-gray-400 mb-4 uppercase tracking-widest">Bases HT pour l'USt-Voranmeldung (Recettes Pro uniquement)</p>
+            <div id="taxModalBody" class="space-y-4"></div>
+            <div class="mt-6 flex justify-end">
+                <button onclick="closeTaxModal()" class="bg-black text-white px-8 py-2 rounded-lg font-bold text-xs uppercase">Fermer</button>
+            </div>
+        </div>
+    </div>
+
 <script>
     let transactions = <?php echo $initial_data_raw ?: '[]'; ?>;
     const categories = <?php echo json_encode($categories_list); ?>;
     let currentUploadTxId = null;
-    let monthsShown = 2;
+    let monthsShown = <?php echo (int)($_SESSION['months_shown'] ?? 2); ?>;
 
     function safeParseDate(str) {
         if (!str) return new Date();
@@ -545,8 +573,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     function resetView() { monthsShown = 2; }
-    function loadMore() { monthsShown += 3; render(); }
-    function showAllMonths() { monthsShown = 999; render(); }
+    function loadMore() { monthsShown += 3; render(); persistMonthsShown(); }
+    function showAllMonths() { monthsShown = 999; render(); persistMonthsShown(); }
+    function persistMonthsShown() {
+        const form = new FormData();
+        form.append('action', 'set_months_shown');
+        form.append('value', monthsShown);
+        fetch('index.php', { method: 'POST', body: form }).catch(() => {});
+    }
 
     function openModal() {
         const copySelect = document.getElementById('m_copy_id');
@@ -602,7 +636,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         const sort = document.getElementById('sortSelect').value;
         const hidePrivate = document.getElementById('hidePrivateToggle').checked;
         const onlyRevenue = document.getElementById('onlyRevenueToggle').checked;
-        
+        const onlyNoCategory = document.getElementById('onlyNoCategoryToggle').checked;
+
         // Logique pour masquer les résumés pendant une recherche
         const isSearching = search.length > 0;
 
@@ -610,6 +645,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             const isPriv = (t.category === 'Privat' || t.isPrivate);
             if (hidePrivate && isPriv) return false;
             if (onlyRevenue && t.type !== 'Entrée') return false;
+            if (onlyNoCategory && t.category) return false;
             return (String(t.numeric_id || '') + ' ' + (t.beneficiary || '') + ' ' + (t.notes || '')).toLowerCase().includes(search);
         });
 
@@ -903,19 +939,95 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             .catch(e => alert('Erreur réseau : ' + e));
     }
 
+    // ===== RÉSUMÉ FISCAL TRIMESTRIEL =====
+
+    function openTaxModal() { document.getElementById('taxModal').style.display = 'flex'; }
+    function closeTaxModal() { document.getElementById('taxModal').style.display = 'none'; }
+
+    function showQuarterlyTaxSummary() {
+        const body = document.getElementById('taxModalBody');
+        body.innerHTML = '';
+
+        const quarterlyData = {}; 
+
+        transactions.forEach(t => {
+            // Uniquement les transactions professionnelles
+            if (t.isPrivate || t.category === 'Privat') return;
+
+            const date = safeParseDate(t.date);
+            const year = date.getFullYear();
+            const quarter = Math.floor(date.getMonth() / 3) + 1;
+            const key = `${year} · Trimestre ${quarter}`;
+
+            if (!quarterlyData[key]) {
+                quarterlyData[key] = { rev19: 0, rev7: 0, rev0: 0, tax19: 0, tax7: 0 };
+            }
+
+            const mwst = parseInt(t.mwst || t.tva || 0);
+            const gross = parseFloat(t.amount || 0);
+            const net = gross / (1 + (mwst / 100));
+            const taxAmount = gross - net;
+
+            if (t.type === 'Entrée') {
+                if (mwst === 19) quarterlyData[key].rev19 += net;
+                else if (mwst === 7) quarterlyData[key].rev7 += net;
+                else if (mwst === 0) quarterlyData[key].rev0 += net;
+            } else {
+                // Dépenses : on calcule la TVA payée (Vorsteuer)
+                if (mwst === 19) quarterlyData[key].tax19 += taxAmount;
+                else if (mwst === 7) quarterlyData[key].tax7 += taxAmount;
+            }
+        });
+
+        const sortedKeys = Object.keys(quarterlyData).sort().reverse();
+
+        if (sortedKeys.length === 0) {
+            body.innerHTML = '<p class="text-gray-500 italic text-center py-8">Aucune donnée professionnelle trouvée pour générer le résumé.</p>';
+        } else {
+            sortedKeys.forEach(key => {
+                const d = quarterlyData[key];
+                const div = document.createElement('div');
+                div.className = 'p-4 border rounded-xl bg-gray-50 shadow-sm';
+                div.innerHTML = `
+                    <h3 class="font-black text-sm mb-3 border-b border-gray-200 pb-1 text-gray-800">${key}</h3>
+                    <div class="space-y-4">
+                        <div class="space-y-1">
+                            <p class="text-[9px] font-black text-gray-400 uppercase mb-1">Recettes (Bases HT)</p>
+                            <div class="flex justify-between text-xs"><span class="text-gray-500">19% Bemessungsgrundlage :</span><span class="font-mono font-black text-blue-600">${d.rev19.toFixed(2)} €</span></div>
+                            <div class="flex justify-between text-xs"><span class="text-gray-500">7% Bemessungsgrundlage :</span><span class="font-mono font-black text-blue-600">${d.rev7.toFixed(2)} €</span></div>
+                            <div class="flex justify-between text-xs"><span class="text-gray-500">Steuerfreie Umsätze (0%) :</span><span class="font-mono font-black text-green-600">${d.rev0.toFixed(2)} €</span></div>
+                        </div>
+                        <div class="space-y-1 pt-2 border-t border-gray-200">
+                            <p class="text-[9px] font-black text-gray-400 uppercase mb-1">Dépenses (TVA payée / Vorsteuer)</p>
+                            <div class="flex justify-between text-xs"><span class="text-gray-500">Abziehbare Vorsteuer (19%) :</span><span class="font-mono font-black text-red-600">${d.tax19.toFixed(2)} €</span></div>
+                            <div class="flex justify-between text-xs"><span class="text-gray-500">Abziehbare Vorsteuer (7%) :</span><span class="font-mono font-black text-red-600">${d.tax7.toFixed(2)} €</span></div>
+                        </div>
+                        <div class="flex justify-between pt-2 border-t-2 border-dashed border-gray-200 text-sm">
+                            <span class="font-black uppercase text-[10px]">Solde TVA (Recettes - Dépenses) :</span>
+                            <span class="font-mono font-black">${((d.rev19 * 0.19 + d.rev7 * 0.07) - (d.tax19 + d.tax7)).toFixed(2)} €</span>
+                        </div>
+                    </div>
+                `;
+                body.appendChild(div);
+            });
+        }
+        openTaxModal();
+    }
+
     // ===== SERVICE INTELLIGENT =====
 
     function smartAnalyze() {
         const alertsBox = document.getElementById('smartAlerts');
         alertsBox.innerHTML = '';
 
-        // 1. Compter les catégories par bénéficiaire (normalisé)
-        const benCats = {}; // { beneficiary: { cat: count } }
+        // 1. Regrouper les IDs de transaction par bénéficiaire (normalisé) et catégorie
+        const benCats = {}; // { beneficiary: { cat: [numeric_id, ...] } }
         transactions.forEach(tx => {
             if (!tx.beneficiary || !tx.category) return;
             const ben = tx.beneficiary.trim().toUpperCase();
             if (!benCats[ben]) benCats[ben] = {};
-            benCats[ben][tx.category] = (benCats[ben][tx.category] || 0) + 1;
+            if (!benCats[ben][tx.category]) benCats[ben][tx.category] = [];
+            benCats[ben][tx.category].push(tx.numeric_id || tx.id);
         });
 
         // 2. Auto-catégorisation : si un bénéficiaire a 3+ occurrences dans une catégorie,
@@ -928,10 +1040,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
             // Trouver la catégorie dominante (3+ occurrences)
             let bestCat = null, bestCount = 0;
-            for (const [cat, count] of Object.entries(benCats[ben])) {
-                if (count >= 3 && count > bestCount) {
+            for (const [cat, ids] of Object.entries(benCats[ben])) {
+                if (ids.length >= 3 && ids.length > bestCount) {
                     bestCat = cat;
-                    bestCount = count;
+                    bestCount = ids.length;
                 }
             }
             if (bestCat) {
@@ -970,12 +1082,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         // 3. Alerte conflit : bénéficiaire dans plusieurs catégories différentes
         const conflicts = [];
         for (const [ben, cats] of Object.entries(benCats)) {
-            const catEntries = Object.entries(cats).filter(([c, n]) => c && c !== 'Privat' && c !== 'Sonstiges');
+            const catEntries = Object.entries(cats).filter(([c, ids]) => c && c !== 'Privat' && c !== 'Sonstiges');
             if (catEntries.length >= 2) {
                 const displayBen = transactions.find(t => t.beneficiary && t.beneficiary.trim().toUpperCase() === ben)?.beneficiary || ben;
                 conflicts.push({
                     beneficiary: displayBen,
-                    categories: catEntries.map(([c, n]) => `${c} (${n}x)`).join(', ')
+                    categories: catEntries.map(([c, ids]) => `${c} (${ids.length}x : ${ids.map(id => '#' + id).join(', ')})`).join(', ')
                 });
             }
         }
